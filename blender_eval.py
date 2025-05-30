@@ -12,6 +12,7 @@ import torchvision.transforms as T
 from src.blender.blender_camera_env import BlenderCameraEnv
 from src.models import DVGFormerConfig, DVGFormerModel
 from src.utils.quaternion_operations import convert_to_local_frame
+from src.utils.fid_eval import quantized_metrics, extract_feats
 from src.data.state_action_conversion import state_avg, state_std, action_avg, action_std
 
 
@@ -48,8 +49,8 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
              'intrinsic': K[None].repeat(b, 1, 1).cuda(),
              'time_steps': torch.arange(0, dtype=torch.long).repeat(b, 1).cuda(),
              'images': torch.zeros(b, 0, 3, config.image_resolution[0], config.image_resolution[1]).cuda(),
-             'states': torch.zeros(b, 0, model.n_action_to_predict, model.config.state_dim).cuda(),
-             'actions': torch.zeros(b, 0, model.n_action_to_predict, model.config.action_dim).cuda(),
+             'states': torch.zeros(b, 0, model.n_action_every_image, model.config.state_dim).cuda(),
+             'actions': torch.zeros(b, 0, model.n_action_every_image, model.config.action_dim).cuda(),
              'seq_length': torch.zeros(b, dtype=torch.long).cuda(),
              'past_key_values': None,
              }
@@ -64,7 +65,7 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
     seq_len = 1
     chunk_offset = 0
     chunk_size = model.max_model_frames // model.fps_downsample
-    chunk_step = chunk_size // 2
+    chunk_step = model.config.chunk_frame_step // model.fps_downsample
     t_ref, q_ref = np.zeros(3), np.array([1, 0, 0, 0])
     while not done:
         # Convert observation to tensor & normalize
@@ -74,7 +75,7 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
         states = torch.stack(
             [torch.tensor(state, dtype=torch.float)] +
             [torch.ones([env.state_dim]) * model.config.ignore_value] *
-            (model.n_action_to_predict - 1))
+            (model.n_action_every_image - 1))
 
         batch['time_steps'] = torch.arange(
             t + 1, dtype=torch.long).repeat(b, 1).cuda()
@@ -87,7 +88,7 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
         if gt_forcing:
             next_actions = force_actions.cuda()[None, [t]].repeat(b, 1, 1, 1)
         else:
-            next_actions = (torch.ones([b, l, model.n_action_to_predict, model.config.action_dim]).cuda() *
+            next_actions = (torch.ones([b, l, model.n_action_every_image, model.config.action_dim]).cuda() *
                             model.config.ignore_value)
         batch['actions'] = torch.cat(
             [batch['actions'], next_actions], dim=1)
@@ -131,8 +132,8 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
         )
         done = terminated or truncated
 
-        tvecs = env.tvecs[-env.n_action_to_predict:-1]
-        qvecs = env.qvecs[-env.n_action_to_predict:-1]
+        tvecs = env.tvecs[-env.n_action_every_image:-1]
+        qvecs = env.qvecs[-env.n_action_every_image:-1]
         states = np.concatenate(
             [state[None],
              (np.concatenate([tvecs, qvecs], axis=1) - state_avg) / state_std])
@@ -154,8 +155,8 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
                       state_std + state_avg)
             _tvecs, _qvecs = states[:, :3], states[:, 3:]
             tvecs, qvecs = np.zeros_like(_tvecs), np.zeros_like(_qvecs)
-            t_ref = _tvecs[chunk_offset * model.n_action_to_predict]
-            q_ref = _qvecs[chunk_offset * model.n_action_to_predict]
+            t_ref = _tvecs[chunk_offset * model.n_action_every_image]
+            q_ref = _qvecs[chunk_offset * model.n_action_every_image]
             if model.motion_option == 'global':
                 actions = (batch['actions'].view(-1, env.action_dim).cpu().numpy() *
                            action_std + action_avg)
@@ -167,7 +168,7 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
                 actions = np.concatenate([vs, omegas], axis=1)
                 batch['actions'] = torch.tensor(
                     (actions - action_avg) / action_std, dtype=torch.float32).view(
-                    b, t, model.n_action_to_predict, model.config.action_dim).cuda()
+                    b, t, model.n_action_every_image, model.config.action_dim).cuda()
             else:
                 for i in range(len(tvecs)):
                     tvecs[i], qvecs[i], _, _ = convert_to_local_frame(
@@ -175,7 +176,7 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
             states = np.concatenate([tvecs, qvecs], axis=1)
             batch['states'] = torch.tensor(
                 (states - state_avg) / state_std, dtype=torch.float32).view(
-                b, t, model.n_action_to_predict, model.config.state_dim).cuda()
+                b, t, model.n_action_every_image, model.config.state_dim).cuda()
             batch['attention_mask'] = \
                 batch['attention_mask'][:, -(chunk_size - chunk_step):]
             # use batch_pt for getting the past_key_values
@@ -197,7 +198,8 @@ def expand_episode(env, config, model, run_name, drone_type=1, seed=None, random
     return total_reward, crash, seq_len
 
 
-def blender_simulation(config, model, logdir, num_runs=40, video_duration=10, re_render=True, force_actions=None):
+def blender_simulation(config, model, logdir, num_runs=50, video_duration=10, re_render=True, force_actions=None,
+                       gt_root='youtube_drone_videos', gt_h5fname='dataset_full.h5', split_name='val'):
     # generated scenes
     infinigen_fpaths = {}
     for scene in sorted(os.listdir(infinigen_root)):
@@ -246,7 +248,7 @@ def blender_simulation(config, model, logdir, num_runs=40, video_duration=10, re
                               cropped_sensor_width=config.cropped_sensor_width) as env:
             for j in range(num_repeats[i]):
                 seed = i * 100 + j + 1
-                drone_type = (seed % len(config.drone_types)) if len(
+                drone_type = (seed % 3 != 0) if len(
                     config.drone_types) > 1 else config.drone_types[0]
                 total_reward, crash, seq_len = expand_episode(
                     env, config, model, run_name=run_name, drone_type=drone_type, seed=seed,
@@ -258,21 +260,33 @@ def blender_simulation(config, model, logdir, num_runs=40, video_duration=10, re
                                 'seq_len': seq_len,
                                 })
 
-    crash_rate = np.mean([result["crash"] is not None for result in results])
+    crash_rate = np.mean(
+        [result["crash"] is not None for result in results]) * 100
     avg_duration = np.mean([result["seq_len"] for result in results])
+    extract_feats(logdir, gt_root, gt_h5fname,
+                  split_name=split_name, feature_type='kinetic')
+    extract_feats(logdir, gt_root, gt_h5fname,
+                  split_name=split_name, feature_type='cimtr')
+    metrics = quantized_metrics(logdir, gt_root, gt_h5fname)
     print(f'Average return: {np.mean([result["total_reward"] for result in results])}\n'
           f'Crash rate: {crash_rate}\n'
-          f'Sequence length: {avg_duration}\n'
+          f'Sequence length: {avg_duration}'
           )
+    for key, value in metrics.items():
+        print(f'{key}: {value}')
 
     # save the crash rate as file
-    with open(f'{logdir}/crash_{crash_rate}', 'w') as f:
+    with open(f'{logdir}/crash_{crash_rate:.2f}', 'w') as f:
         f.write(f'{crash_rate}')
     # save the average duration as file
     with open(f'{logdir}/duration_{avg_duration:.2f}', 'w') as f:
         f.write(f'{avg_duration}')
+    # save the metrics as file
+    for key, value in metrics.items():
+        with open(f'{logdir}/{key}_{value:.3f}', 'w') as f:
+            f.write(f'{value}')
 
-    return results
+    return results, metrics
 
 
 if __name__ == '__main__':
@@ -283,22 +297,37 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Blender evaluation')
     # data settings
-    parser.add_argument('--logdir', type=str, required=True)
+    parser.add_argument('--logdir', type=str, default=None)
     args = parser.parse_args()
 
     model = DVGFormerModel.from_pretrained(
-        args.logdir,
+        'yunzhong-hou/DVGFormer' if args.logdir is None else args.logdir,
         ignore_mismatched_sizes=True).cuda().bfloat16()
 
-    from src.data.drone_path_seq_dataset import DronePathSequenceDataset
-    dataset = DronePathSequenceDataset('youtube_drone_videos',
-                                       'dataset_mini.h5',
-                                       motion_option=model.config.motion_option,
-                                       )
-    print(len(dataset))
-    data = dataset.__getitem__(0, visualize=True)
+    # from src.data.drone_path_seq_dataset import DronePathSequenceDataset
+    # dataset = DronePathSequenceDataset('youtube_drone_videos',
+    #                                    'dataset_mini.h5',
+    #                                    motion_option=model.config.motion_option,
+    #                                    )
+    # print(len(dataset))
+    # data = dataset.__getitem__(0, visualize=True)
+
+    # config = DVGFormerConfig(
+    #     fps=3,
+    #     execute_option='next_state',
+    #     # prediction_option='one-shot',
+    #     # action_option='sparse',
+    #     # max_model_frames=30,
+    #     n_token_state=0,
+    #     n_token_action=0,
+    #     # attn_implementation='flash_attention_2'
+    # )
+    # device = 'cuda'
+    # model = DVGFormerModel(config).to(device)
+    # model.eval()
 
     blender_simulation(model.config, model, args.logdir,
                        num_runs=50, video_duration=10,
+                       re_render=False,
                        #   force_actions=data['actions']
                        )

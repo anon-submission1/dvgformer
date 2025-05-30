@@ -1,22 +1,157 @@
+import os
+import bpy
+import time
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import open3d as o3d
 from transforms3d.quaternions import qinverse, qmult, quat2mat, mat2quat, qnorm, rotate_vector
+from transforms3d.euler import euler2quat, quat2euler, euler2mat, mat2euler
 from transforms3d.axangles import axangle2mat
 from scipy.spatial.transform import Rotation
 from src.utils.colmap_official_read_write_model import read_model
+from src.blender.blender_camera_env import R_colmap_from_blender, R_blender_cam_dir
+from src.utils.quaternion_operations import convert_to_global_frame, convert_to_local_frame, interpolate_eulers, interpolate_tvecs
 
 
-def visualize_points(points3d):
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(
-        np.array([point.xyz for point in points3d.values()]))
-    pcd.colors = o3d.utility.Vector3dVector(
-        np.array([point.rgb / 255 for point in points3d.values()]))
-    return [pcd]
+def colmap_pose_to_extrinsic(qvec, tvec, camera_to_world=False):
+    """
+    Convert COLMAP qvec and tvec to a 4x4 transformation matrix.
+
+    Parameters:
+        qvec (np.ndarray): Quaternion [qw, qx, qy, qz]
+        tvec (np.ndarray): Translation vector [tx, ty, tz]
+        camera_to_world (bool): If True, returns camera-to-world matrix.
+                                If False, returns world-to-camera.
+
+    Returns:
+        4x4 numpy.ndarray: Extrinsic transformation matrix.
+    """
+    R = quat2mat(qvec)
+    t = np.array(tvec).reshape(3, 1)
+
+    # World-to-camera
+    extrinsic_wc = np.eye(4)
+    extrinsic_wc[:3, :3] = R
+    extrinsic_wc[:3, 3] = t.squeeze()
+
+    if camera_to_world:
+        # Invert to get camera-to-world
+        R_inv = R.T
+        t_inv = -R_inv @ t
+        extrinsic_cw = np.eye(4)
+        extrinsic_cw[:3, :3] = R_inv
+        extrinsic_cw[:3, 3] = t_inv.squeeze()
+        return extrinsic_cw
+    else:
+        return extrinsic_wc
 
 
-def visualize_cameras(tvecs, qvecs, size=0.5):
+def draw_camera_frustum(intrinsic, extrinsic, image_size, scale=100, color=[1, 0, 0]):
+    """
+    Draws a camera frustum in Open3D.
+
+    Parameters:
+        intrinsic (np.ndarray): 3x3 intrinsic matrix.
+        extrinsic (np.ndarray): 4x4 camera-to-world transformation matrix.
+        image_size (tuple): (width, height) of the image.
+        scale (float): Scale factor for the frustum size.
+        color (list): RGB color of the frustum lines.
+
+    Returns:
+        open3d.geometry.LineSet: The frustum as a LineSet.
+    """
+    w, h = image_size
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+    # Define 4 corners of the image plane in camera coordinates
+    corners = np.array([
+        [(0 - cx) / fx, (0 - cy) / fy, 1],
+        [(w - cx) / fx, (0 - cy) / fy, 1],
+        [(w - cx) / fx, (h - cy) / fy, 1],
+        [(0 - cx) / fx, (h - cy) / fy, 1]
+    ]) * scale
+
+    # Add camera origin
+    points = np.vstack(([0, 0, 0], corners))  # (5, 3)
+
+    # Transform to world coordinates
+    R = extrinsic[:3, :3]
+    t = extrinsic[:3, 3]
+    points_world = (R @ points.T).T + t
+
+    # Define lines: 0 is camera origin
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],
+        [1, 2], [2, 3], [3, 4], [4, 1]
+    ]
+
+    # Create LineSet
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(points_world),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+    line_set.colors = o3d.utility.Vector3dVector([color for _ in lines])
+    return line_set
+
+
+def create_cylinder_line(p1, p2, radius=0.005, color=[0.8, 0.2, 0.8]):
+    """
+    Create a cylinder between two points p1 and p2.
+    """
+    # Create a mesh cylinder of the given radius
+    mesh_cylinder = o3d.geometry.TriangleMesh.create_cylinder(
+        radius=radius, height=np.linalg.norm(p2 - p1))
+    mesh_cylinder.paint_uniform_color(color)
+
+    # Compute the transformation for the cylinder
+    cyl_transform = np.eye(4)
+    cyl_transform[0:3, 3] = (p1 + p2) / 2
+    # Align the cylinder with the line p1 -> p2
+    v = p2 - p1
+    v /= np.linalg.norm(v)
+    axis = np.array([0, 0, 1])  # Initial axis of the cylinder
+    axis_x_v = np.cross(axis, v)
+    angle = np.arctan2(np.linalg.norm(axis_x_v), np.dot(axis, v))
+
+    cyl_transform[0:3, 0:3] = o3d.geometry.get_rotation_matrix_from_axis_angle(
+        axis_x_v / np.linalg.norm(axis_x_v) * angle)
+
+    # Apply the transformation
+    mesh_cylinder.transform(cyl_transform)
+
+    return mesh_cylinder
+
+
+def lineset_to_cylinders(lineset, radius=0.01):
+    """
+    Convert a LineSet to a list of cylinders to simulate thick lines.
+
+    Parameters:
+        lineset (o3d.geometry.LineSet): Input LineSet
+        radius (float): Cylinder radius
+
+    Returns:
+        List of TriangleMesh (cylinders)
+    """
+    points = np.asarray(lineset.points)
+    lines = np.asarray(lineset.lines)
+    colors = np.asarray(lineset.colors) if lineset.has_colors() else [
+        [0.5, 0.5, 0.5]] * len(lines)
+
+    cylinders = []
+    for (i, (start_idx, end_idx)) in enumerate(lines):
+        p1, p2 = points[start_idx], points[end_idx]
+        color = colors[i % len(colors)]
+        cyl = create_cylinder_line(p1, p2, radius, color)
+        if cyl is not None:
+            cylinders.append(cyl)
+
+    return cylinders
+
+
+def visualize_camera_coords(tvecs, qvecs, size=0.5):
     # Visualize camera poses
     geometries = []
     for tvec, qvec in zip(tvecs, qvecs):
@@ -59,85 +194,101 @@ def plot_camera_lines(tvecs, color=[0.8, 0.2, 0.8]):
     return [camera_path]
 
 
-def create_cylinder_line(p1, p2, radius=0.005, color=[0.8, 0.2, 0.8]):
+def export_point_cloud_to_ply(blend_file_path, output_ply_path):
     """
-    Create a cylinder between two points p1 and p2.
+    Opens a .blend file and exports its point cloud data to a .ply file
+
+    Parameters:
+    blend_file_path (str): Path to the .blend file
+    output_ply_path (str): Path where the .ply file will be saved
     """
-    # Create a mesh cylinder of the given radius
-    mesh_cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=radius, height=np.linalg.norm(p2 - p1))
-    mesh_cylinder.paint_uniform_color(color)
+    # Clear existing data
+    bpy.ops.wm.open_mainfile(filepath=blend_file_path)
 
-    # Compute the transformation for the cylinder
-    cyl_transform = np.eye(4)
-    cyl_transform[0:3, 3] = (p1 + p2) / 2
-    # Align the cylinder with the line p1 -> p2
-    v = p2 - p1
-    v /= np.linalg.norm(v)
-    axis = np.array([0, 0, 1])  # Initial axis of the cylinder
-    axis_x_v = np.cross(axis, v)
-    angle = np.arctan2(np.linalg.norm(axis_x_v), np.dot(axis, v))
+    # Get all mesh objects in the scene
+    mesh_objects = [
+        obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
 
-    cyl_transform[0:3, 0:3] = o3d.geometry.get_rotation_matrix_from_axis_angle(
-        axis_x_v / np.linalg.norm(axis_x_v) * angle)
+    if not mesh_objects:
+        print("No mesh objects found in the .blend file")
+        return False
 
-    # Apply the transformation
-    mesh_cylinder.transform(cyl_transform)
+    # Collect all vertices from all mesh objects
+    all_vertices = []
 
-    return mesh_cylinder
+    skip_name_list = ['outofview', 'CameraRigs',
+                      'atmosphere', 'inview', 'unapplied']
+
+    for obj in mesh_objects:
+        if any(substring in obj.name for substring in skip_name_list):
+            continue
+        # Get world matrix for the object
+        world_matrix = obj.matrix_world
+
+        # Get mesh data
+        mesh = obj.data
+
+        # Extract vertices in world space
+        for vertex in mesh.vertices:
+            # Transform vertex to world space
+            world_vertex = world_matrix @ vertex.co
+            all_vertices.append(
+                (world_vertex.x, world_vertex.y, world_vertex.z))
+
+    if not all_vertices:
+        print("No vertices found in the mesh objects")
+        return False
+
+    # Convert to numpy array for easier processing
+    points = np.array(all_vertices)
+
+    # Write to PLY file
+    with open(output_ply_path, 'w') as f:
+        # Write header
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("end_header\n")
+
+        # Write vertex data
+        for point in points:
+            f.write(f"{point[0]} {point[1]} {point[2]}\n")
+
+    print(f"Successfully exported {len(points)} points to {output_ply_path}")
 
 
-def plot_camera_cylinders(tvecs, radius=0.03, color=[0.8, 0.2, 0.8]):
-    """
-    Plots a camera path as a series of cylinders.
-    """
-    line_set = o3d.geometry.LineSet()
-    cylinders = []
+def main(fpath):
 
-    for i in range(len(tvecs) - 1):
-        p1 = tvecs[i]
-        p2 = tvecs[i + 1]
-        cylinders.append(create_cylinder_line(
-            np.array(p1), np.array(p2), radius=radius, color=color))
+    # get the blender fpath
+    with open(fpath, 'r') as f:
+        line = f.readline()
+    blender_fpath = line.split(' ')[1].strip()
+    # convert .blend file to .ply file with only the point cloud
+    point_cloud_fpath = blender_fpath.replace('.blend', '.ply')
+    # Define the screenshot path
+    screenshot_path = fpath.replace('.txt', '.jpg')
 
-    return cylinders
+    # image size
+    h, w = 225, 400
+    # focal length in mm
+    focal_length = float(line.split(' ')[-1].split(':')[-1].strip())
+    # sensor width in mm
+    sensor_width = 36
+    # convert focal length to pixel
+    focal_length = (focal_length / sensor_width) * w
+    # camera intrinsic matrix
+    intrinsic = np.array([[focal_length, 0, w / 2],
+                          [0, focal_length, h / 2],
+                          [0, 0, 1]])
 
-
-def main():
-    # Example tvecs and qvecs
-    # Replace these with your actual tvecs
-    # tvecs = [np.array([1, 2, 3]), np.array([4, 5, 6])]
-    # # Replace these with your actual qvecs
-    # qvecs = [np.array([1, 0, 0, 0]), np.array([0, 1, 0, 0])]
-    # cameras, images, points3D = read_model(
-    #     'demo/8jT9ygmMvMg/scene00002_0/sparse/0')
-
-    # calculation from tvec and qvec directly
-    # transforms3d
-    # tvecs = np.array([-qmult(qinverse(img.qvec),
-    #                          qmult(np.insert(img.tvec, 0, 0), img.qvec))[1:] for img in images.values()])
-    # qvecs = np.array([qinverse(img.qvec) for img in images.values()])
-    # scipy
-    # tvecs, qvecs = [], []
-    # for img in images.values():
-    #     rotation = Rotation.from_quat(img.qvec[[1, 2, 3, 0]]).inv()
-    #     tvecs.append(-rotation.apply(img.tvec))
-    #     qvecs.append(rotation.as_quat()[[3, 0, 1, 2]])
-    # tvecs, qvecs = np.array(tvecs), np.array(qvecs)
-
-    import time
-    from transforms3d.euler import euler2quat, quat2euler, euler2mat, mat2euler
-    from src.blender.blender_camera_env import R_colmap_from_blender, R_blender_cam_dir
-    from src.utils.quaternion_operations import convert_to_global_frame, convert_to_local_frame, interpolate_eulers, interpolate_tvecs
-    # Example usage
-    # fpath = 'None/videos/fpv_rome_return10.00_crashNone_501_2025-01-25_15-45-46_config.txt'
-    fpath = 'None/videos/debug_None_2025-01-26_01-13-14_config.txt'
-
-    # blender coordinates
+    # blender coordinates in 30 fps
     loc_rot = np.loadtxt(fpath)
-    loc_rot = loc_rot[::3]
-    locations = loc_rot[:, :3]
-    directions = loc_rot[:, 3:]
+    # convert to 15 fps
+    locations = loc_rot[::2, :3]
+    directions = loc_rot[::2, 3:]
     # tvec and qvec from blender
     tvecs = locations
     qvecs = np.zeros((len(directions), 4))
@@ -152,8 +303,11 @@ def main():
         qvecs[i] = qvec
 
     # Load the mesh or point cloud
-    mesh = o3d.io.read_triangle_mesh(
-        '/home/houyz/Data/blosm/himeji/scene.ply')
+    if not os.path.exists(point_cloud_fpath):
+        # Export the point cloud from the .blend file
+        export_point_cloud_to_ply(blender_fpath, point_cloud_fpath)
+    # Read the mesh from the .ply file
+    mesh = o3d.io.read_triangle_mesh(point_cloud_fpath)
     # Create a point cloud from the vertices of the mesh
     point_cloud = o3d.geometry.PointCloud()
     point_cloud.points = mesh.vertices
@@ -161,6 +315,10 @@ def main():
     # Downsample with a voxel size of (for example) 0.02
     voxel_size = 2.0
     downsampled_pcd = point_cloud.voxel_down_sample(voxel_size=voxel_size)
+    if 'infinigen' in blender_fpath:
+        # filter out points with z < 0
+        downsampled_pcd = downsampled_pcd.select_by_index(
+            np.where(np.asarray(downsampled_pcd.points)[:, 2] > 0)[0])
     # add color to the downsampled point cloud according to their z value
     z = np.asarray(downsampled_pcd.points)[:, 2]
     z = (z - z.min()) / (z.max() - z.min())
@@ -169,76 +327,108 @@ def main():
         plt.cm.rainbow(z)[:, :3]
     )
 
+    target_color = np.array([0.8, 0.2, 0.8])
+    white_color = np.array([1, 1, 1])
+    min_color_ratio = 0.4
     # visualize(tvecs, qvecs)
     geometries = []
     # geometries.extend(visualize_points(points3D))
-    geometries.extend(visualize_cameras(tvecs, qvecs, 2))
-    # geometries.extend(visualize_cameras(tvecs[:36], qvecs[:36], 1))
-    # geometries.extend(visualize_cameras(tvecs[36:], qvecs[36:], 2))
-    # geometries.extend(plot_camera_lines(tvecs))
-    geometries.extend(plot_camera_cylinders(tvecs, radius=0.1))
-    # geometries.extend(plot_camera_cylinders(
-    #     tvecs[:36], radius=0.1, color=[0.6, 0.6, 0.6]))
-    # geometries.extend(plot_camera_cylinders(tvecs[36:], radius=0.1))
+    # geometries.extend(visualize_camera_coords(tvecs, qvecs, 0.5))
+    # geometries.extend(plot_camera_lines(
+    #     tvecs, color=(target_color * 0.3 + white_color * 0.7)))
     geometries.extend([downsampled_pcd])
 
-    # Visualization
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
+    is_fpv = '_fpv_' in fpath
+    if is_fpv:
+        fps_downsample = 5  # to 3 fps
+        camera_scale = 1
+    else:
+        fps_downsample = 15
+        camera_scale = 10
 
-    vis.get_render_option().line_width = 200
-    # vis.get_render_option().point_size = 5
+    # camera frustum
+    for i in range(0, len(tvecs), fps_downsample):
+        tvec = tvecs[i]
+        qvec = qvecs[i]
+        alpha = min_color_ratio + \
+            (i / (len(tvecs) - 1)) * (1 - min_color_ratio)
+        color = alpha * target_color + (1 - alpha) * white_color
+        extrinsic = colmap_pose_to_extrinsic(qvec, tvec)
+        frustum = draw_camera_frustum(
+            intrinsic, extrinsic, (w, h), scale=camera_scale, color=color)
+        geometries.append(frustum)
 
-    # Add geometries to the visualizer
-    for geometry in geometries:
-        vis.add_geometry(geometry)
+    # replace the lines in geometries with cylinders
+    cylinders_all = []
+    for i in reversed(range(len(geometries))):
+        g = geometries[i]
+        if isinstance(g, o3d.geometry.LineSet):
+            cylinders = lineset_to_cylinders(g, radius=0.2)
+            cylinders_all.extend(cylinders)
+            geometries.pop(i)
+    # add the cylinders to the geometries
+    geometries.extend(cylinders_all)
 
-    # Get view control and adjust camera
-    view_ctl = vis.get_view_control()
+    # Create a custom visualizer function with screenshot capability
+    def custom_draw_geometries_with_screenshot_callback(geometries):
+        # Create a visualizer object
+        vis = o3d.visualization.VisualizerWithKeyCallback()
+        vis.create_window()
 
-    # Set the front, lookat, up, and zoom parameters
-    # These parameters adjust the camera's position and orientation in the visualization
-    # Example: Setting a view that roughly corresponds to rotating the scene 180 degrees around the Y-axis
-    # Note: You'll need to adjust these values based on your specific dataset and desired view
-    # camera_params = {
-    #     # Points in the direction the camera is looking
-    #     # "front": np.array([0., 0., -1.]),
-    #     # pitch the camera down a bit
-    #     "front": np.array([1., -0.5, -1.]),
-    #     # The point the camera is looking at
-    #     "lookat": np.array([0., 0., 0.]),
-    #     # The "up" direction in the camera coordinate system
-    #     "up": np.array([0., -1., 0.]),
-    #     "zoom": 0.1                        # Zoom level
-    # }
+        # Set render options
+        vis.get_render_option().point_size = 10
 
-    # in blender convention
-    # x: right, y: forward, z: up
-    camera_params = {
-        # Points in the direction the camera is looking
-        "front": np.array([-1., -0.5, 0.5]),
-        # The point the camera is looking at
-        "lookat": tvecs[0],
-        # The "up" direction in the camera coordinate system
-        "up": np.array([0., 0., 1.]),
-        "zoom": 0.05                        # Zoom level
-    }
-    view_ctl.set_front(camera_params["front"])
-    view_ctl.set_lookat(camera_params["lookat"])
-    view_ctl.set_up(camera_params["up"])
-    view_ctl.set_zoom(camera_params["zoom"])
+        # Add geometries
+        for geometry in geometries:
+            vis.add_geometry(geometry)
 
-    camera_params = view_ctl.convert_to_pinhole_camera_parameters()
-    # Save camera location and the lookat point
-    R, t = camera_params.extrinsic[:3, :3], camera_params.extrinsic[:3, 3]
-    camera_location = -R.T @ t
-    lookat_point = tvecs[0]
-    # Save the camera parameters
-    np.savetxt("camera_location.txt", camera_location, fmt='%f')
-    np.savetxt("lookat_point.txt", lookat_point, fmt='%f')
+        # Set up the view
+        view_ctl = vis.get_view_control()
+        camera_params = {
+            "front": tvecs[0] - tvecs[len(tvecs) // 2],
+            "lookat": tvecs[0],
+            "up": np.array([0., 0., 1.]),
+            "zoom": 0.001
+        }
+        view_ctl.set_front(camera_params["front"])
+        view_ctl.set_lookat(camera_params["lookat"])
+        view_ctl.set_up(camera_params["up"])
+        view_ctl.set_zoom(camera_params["zoom"])
 
-    # save the 3d scene as .glb file with all the geometries
-    # merges all points into one cloud
+        # Define the screenshot callback function
+        def take_screenshot(vis):
+            print(f"Saving screenshot to {screenshot_path}")
+            vis.capture_screen_image(screenshot_path, True)
+            print(f"Screenshot saved to {screenshot_path}")
+            return True
+
+        # Register the 'S' key for saving screenshot
+        vis.register_key_callback(ord('S'), take_screenshot)
+
+        # Print instructions
+        print("Press 'S' to save a screenshot.")
+
+        # Run the visualizer
+        vis.run()
+        vis.destroy_window()
+
+        # Save camera parameters after window closes
+        camera_params = view_ctl.convert_to_pinhole_camera_parameters()
+        R, t = camera_params.extrinsic[:3, :3], camera_params.extrinsic[:3, 3]
+        camera_location = -R.T @ t
+        lookat_point = tvecs[0]
+
+        # Save the camera parameters
+        np.savetxt("camera_location.txt", camera_location, fmt='%f')
+        np.savetxt("lookat_point.txt", lookat_point, fmt='%f')
+
+        return camera_location, lookat_point
+
+    # Use our custom function instead of the original visualization code
+    camera_location, lookat_point = custom_draw_geometries_with_screenshot_callback(
+        geometries)
+
+    # Save the 3D scene files (this remains the same)
     combined_pcd = o3d.geometry.PointCloud()
     for g in geometries:
         if isinstance(g, o3d.geometry.PointCloud):
@@ -251,10 +441,7 @@ def main():
             combined_mesh += g
     o3d.io.write_triangle_mesh("combined_mesh.ply", combined_mesh)
 
-    # Run the visualizer
-    vis.run()
-    vis.destroy_window()
-
 
 if __name__ == '__main__':
-    main()
+    logdir = input("Please enter the log directory: ")
+    main(logdir)

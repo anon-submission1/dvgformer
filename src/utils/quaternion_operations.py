@@ -267,6 +267,13 @@ def interpolate_eulers(rots, times, new_times):
     return interpolated_rots
 
 
+def interpolate_qvecs(qvecs, times, new_times):
+    key_rots = Rotation.from_quat(qvecs, scaler_first=True)
+    slerp = Slerp(times, key_rots)
+    interpolated_rots = slerp(new_times).as_euler('xyz')
+    return interpolated_rots
+
+
 def horizontal_flip(tvec, qvec, v=None, omega=None):
     """
     Equavalent operation on the position, orientation, velocity, and angular velocity to a horizontal flip to the image.

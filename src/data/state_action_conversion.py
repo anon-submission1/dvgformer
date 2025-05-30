@@ -11,55 +11,41 @@ from src.utils.quaternion_operations import convert_to_local_frame, convert_to_g
 from src.utils.flexible_fs import FlexibleFileSystem
 from src.utils.pytorch3d_rotation_conversion import euler_angles_to_matrix, matrix_to_euler_angles, quaternion_to_matrix, matrix_to_quaternion
 
-# non fpv
-# states: mean=tensor([ 1.2421e+00,  4.5750e-02,  1.1822e+01,  9.9537e-01,  1.4548e-02,
-#         -1.4246e-03, -1.2822e-03]), std=tensor([4.2592e+01, 3.3490e+01, 3.1488e+01, 1.3026e-02, 6.6444e-02, 6.0955e-02,
-#         2.6775e-02])
-# actions: mean=tensor([ 2.1370e-02,  2.6168e-02,  1.2340e-01,  4.7324e-04, -4.9387e-05,
-#         -4.2312e-05]), std=tensor([0.5899, 0.4807, 0.4158, 0.0019, 0.0018, 0.0008])
-# stops: mean=0.0428212434053421
-# stops: mean=0.003826059401035309 (ignore truncated sequences)
-# lengths: 23.352894664466447
-# norms: tvec=53.28983688354492, v=0.826926589012146, omega=0.0018915075343102217
+# non fpv (30854 clips, 3622930 frames)
+# states: mean=[ 0.80087  0.10283  7.01349  0.99618  0.0134  -0.00143 -0.00112], std=[23.91302 17.78868 16.91058  0.00793  0.05216  0.04776  0.01807]
+# actions: mean=[ 0.01284  0.01375  0.07347  0.00045 -0.00005 -0.00004], std=[0.32955 0.2588  0.22428 0.00159 0.00146 0.00057]
+# stops: mean=0.02355
+# lengths: 23.48435
+# norms: tvec=31.76287, v=0.49480, omega=0.00197
 
-# fpv
-# states: mean=tensor([-3.2432e-01, -5.3843e+00,  3.2573e+01,  8.2942e-01,  4.8356e-02,
-#         -3.5693e-02, -9.3243e-03]), std=tensor([2.4091e+01, 1.9568e+01, 3.4490e+01, 3.2701e-01, 1.6414e-01, 3.7465e-01,
-#         1.8474e-01])
-# actions: mean=tensor([ 0.0474, -0.0179,  0.5670,  0.0031, -0.0023, -0.0007]), std=tensor([0.4838, 0.3688, 0.5108, 0.0119, 0.0238, 0.0178])
-# stops: mean=0.06011144444346428
-# stops: mean=0.00889990758150816 (ignore truncated sequences)
-# lengths: 16.635766986959506
-# norms: tvec=45.921024322509766, v=0.8875867128372192, omega=0.019362641498446465
+# fpv (68149 clips, 5973175 frames)
+# states: mean=[-0.00963 -5.92972 37.03546  0.84379  0.04756 -0.03609 -0.00873], std=[24.11987 18.97639 35.83229  0.28517  0.13522  0.35493  0.15497]
+# actions: mean=[ 0.04631 -0.04666  0.64891  0.00307 -0.00205 -0.00064], std=[0.44675 0.35029 0.47971 0.00831 0.01921 0.01118]
+# stops: mean=0.03519
+# lengths: 17.52975
+# norms: tvec=51.89588, v=1.00195, omega=0.01946
+
+# both (99003 clips, 9596105 frames)
+# states: mean=[ 0.29259 -3.64301 25.47237  0.9068   0.03375 -0.02301 -0.00576], std=[23.68868 18.63657 32.92044  0.21947  0.1064   0.27115  0.11438]
+# actions: mean=[ 0.03357 -0.0242   0.42988  0.00202 -0.00126 -0.00039], std=[0.39975 0.31296 0.48182 0.00619 0.01413 0.00791]
+# stops: mean=0.03080
+# lengths: 19.38548
+# norms: tvec=43.92965, v=0.80739, omega=0.01250
 
 
 # state: tvec, qvec (all in global reference frame)
-# state_avg = {0: np.array([0, 0, 0,
-#                           0.995, 0, 0, 0]),
-#              1: np.array([0, 0, 0,
-#                           0.8, 0, 0, 0])}
-state_avg = np.array([0, 0, 0,
-                      0.8, 0, 0, 0])
-# state_std = {0: np.array([40, 30, 30,
-#                           0.01, 0.07, 0.06, 0.03]),
-#              1: np.array([20, 20, 30,
-#                           0.3, 0.2, 0.4, 0.2])}
-state_std = np.array([30, 30, 30,
-                      0.3, 0.3, 0.3, 0.3])
+state_avg = np.array([0.30, -3.6, 25, 0.91, 0.033, -0.023, -0.0058])
+state_std = np.array([24, 19, 33, 0.22, 0.11, 0.27, 0.11])
 
 # action: v, omega (both local, relative to the current frame)
-# action_avg = {0: np.zeros(6),
-#               1: np.zeros(6)}
-action_avg = np.zeros(6)
-# action_std = {0: np.array([0.6, 0.5, 0.4,
-#                            0.002, 0.002, 0.001]),
-#               1: np.array([0.5, 0.4, 0.5,
-#                            0.01, 0.02, 0.01])}
-action_std = np.array([0.5, 0.5, 0.5,
-                       0.01, 0.02, 0.01])
+action_avg = np.array([0.034, -0.024, 0.43, 0.0020, -0.0013, -0.00039])
+action_std = np.array([0.40, 0.31, 0.48, 0.0062, 0.014, 0.0079])
+
+# state_avg, state_std = np.zeros_like(state_avg), np.ones_like(state_std)
+# action_avg, action_std = np.zeros_like(action_avg), np.ones_like(action_std)
 
 
-def get_states_actions(tvecs, qvecs, motion_option='global', action_downsample=1):
+def get_states_actions(tvecs, qvecs, motion_option='global'):
     '''
     Get the states and actions from tvecs, qvecs, vs, and omegas.
         tvec(t)
@@ -74,38 +60,34 @@ def get_states_actions(tvecs, qvecs, motion_option='global', action_downsample=1
         tvecs (array): (N + 1) x 3 array of translation vectors for all frames.
         qvecs (array): (N + 1) x 4 array of rotation quaternions for all frames.
         motion_option (str): 'global' or 'local' motion.
-        action_downsample (int): Downsample rate for the actions.
     Returns:
-        states (array): (N // action_downsample) x 7, States (position, rotation).
-        actions (tensor): (N // action_downsample) x 6, Actions (velocity, angular velocity).
+        states (array): N x 7, States (position, rotation).
+        actions (tensor): N x 6, Actions (velocity, angular velocity).
     '''
-    # time steps
-    num_frames = (len(tvecs) - 1) // action_downsample
+    N = len(tvecs) - 1
     # States: camera pose (location and rotation) in the global coordinate system
-    states = np.concatenate([tvecs, qvecs], axis=1)[
-        np.arange(num_frames) * action_downsample]
+    states = np.concatenate([tvecs, qvecs], axis=1)[:N]
     # Actions: camera motion (velocities and angular velocities) in the global/local coordinate system (relative to the *current* frame)
-    # stack every action_downsample frames
-    vs = np.zeros([num_frames, 3])
-    omegas = np.zeros([num_frames, 3])
-    for i in range(num_frames):
-        vs[i] = tvecs[(i + 1) * action_downsample] - \
-            tvecs[i * action_downsample]
+    vs = np.zeros([N, 3])
+    omegas = np.zeros([N, 3])
+    for i in range(N):
+        vs[i] = tvecs[i + 1] - tvecs[i]
         omegas[i] = quaternions_to_angular_velocity(
-            qvecs[i * action_downsample], qvecs[(i + 1) * action_downsample], 1)
+            qvecs[i], qvecs[i + 1], 1)
     if motion_option == 'global':
         actions = np.concatenate([vs, omegas], axis=1)
     elif motion_option == 'local':
         actions = []
-        for i in range(num_frames):
+        for i in range(N):
             _, _, v_local, omega_local = convert_to_local_frame(
-                tvecs[i * action_downsample], qvecs[i * action_downsample],
+                tvecs[i], qvecs[i],
                 None, None, vs[i], omegas[i])
             action = np.concatenate([v_local, omega_local])
             actions.append(action)
+        actions = np.stack(actions)
     else:
         raise ValueError('Invalid motion_option')
-    return states, np.stack(actions)
+    return states, actions
 
 
 def reverse_states_actions(states, actions, motion_option='global'):
@@ -161,52 +143,52 @@ def reverse_states_actions(states, actions, motion_option='global'):
 
     return next_tvecs, next_qvecs, vs, omegas
 
+# TODO: the tensor version is not correct...
+# def reverse_states_actions_tensor(states, actions, motion_option='global'):
+#     '''
+#     Differentiable version of reverse_states_actions.
+#     Args:
+#         states (tensor): [N, 7] tensor of states (camera pose in global coord system).
+#         actions (tensor): [N, 6] tensor of  of actions (camera motion in global/local coord system).
+#     Returns:
+#         next_tvecs (tensor): [N, 3] tensor of translation vector.
+#         next_qvecs (tensor): [N, 4] tensor of rotation quaternions.
+#         vs (tensor): [N, 3] tensor of velocities.
+#         omegas (tensor): [N, 3] tensor of angular velocities.
+#     '''
+#     N = len(states)
+#     # global coord system (w.r.t. the initial frame)
+#     next_tvecs = []
+#     next_qvecs = []
+#     vs = []
+#     omegas = []
 
-def reverse_states_actions_tensor(states, actions, motion_option='global'):
-    '''
-    Differentiable version of reverse_states_actions.
-    Args:
-        states (tensor): [N, 7] tensor of states (camera pose in global coord system).
-        actions (tensor): [N, 6] tensor of  of actions (camera motion in global/local coord system).
-    Returns:
-        next_tvecs (tensor): [N, 3] tensor of translation vector.
-        next_qvecs (tensor): [N, 4] tensor of rotation quaternions.
-        vs (tensor): [N, 3] tensor of velocities.
-        omegas (tensor): [N, 3] tensor of angular velocities.
-    '''
-    N = len(states)
-    # global coord system (w.r.t. the initial frame)
-    next_tvecs = []
-    next_qvecs = []
-    vs = []
-    omegas = []
+#     # Apply actions to reconstruct subsequent frames
+#     for i in range(N):
+#         R1 = quaternion_to_matrix(states[i, 3:])
+#         if motion_option == 'global':
+#             v, omega = actions[i, :3], actions[i, 3:]
+#         elif motion_option == 'local':
+#             # convert to the global coordinate system
+#             v = R1 @ actions[i, :3]
+#             omega = R1 @ actions[i, 3:]
+#         else:
+#             raise ValueError('Invalid motion_option')
+#         vs.append(v)
+#         omegas.append(omega)
+#         delta_R = euler_angles_to_matrix(omega, 'XYZ')
+#         # location and rotation for the next frame
+#         next_tvec = states[i, :3] + v
+#         next_tvecs.append(next_tvec)
+#         next_R = delta_R @ R1
+#         next_qvec = matrix_to_quaternion(next_R)
+#         next_qvecs.append(next_qvec)
+#     next_tvecs = torch.stack(next_tvecs)
+#     next_qvecs = torch.stack(next_qvecs)
+#     vs = torch.stack(vs)
+#     omegas = torch.stack(omegas)
 
-    # Apply actions to reconstruct subsequent frames
-    for i in range(N):
-        R1 = quaternion_to_matrix(states[i, 3:])
-        if motion_option == 'global':
-            v, omega = actions[i, :3], actions[i, 3:]
-        elif motion_option == 'local':
-            # convert to the global coordinate system
-            v = R1 @ actions[i, :3]
-            omega = R1 @ actions[i, 3:]
-        else:
-            raise ValueError('Invalid motion_option')
-        vs.append(v)
-        omegas.append(omega)
-        delta_R = euler_angles_to_matrix(omega, 'XYZ')
-        # location and rotation for the next frame
-        next_tvec = states[i, :3] + v
-        next_tvecs.append(next_tvec)
-        next_R = delta_R @ R1
-        next_qvec = matrix_to_quaternion(next_R)
-        next_qvecs.append(next_qvec)
-    next_tvecs = torch.stack(next_tvecs)
-    next_qvecs = torch.stack(next_qvecs)
-    vs = torch.stack(vs)
-    omegas = torch.stack(omegas)
-
-    return next_tvecs, next_qvecs, vs, omegas
+#     return next_tvecs, next_qvecs, vs, omegas
 
 
 def main():
@@ -274,29 +256,30 @@ def main():
         tvecs, qvecs, motion_option=motion_option)
     _next_tvecs, _next_qvecs, _vs, _omegas = reverse_states_actions(
         states, actions, motion_option=motion_option)
-    __next_tvecs, __next_qvecs, __vs, __omegas = reverse_states_actions_tensor(
-        torch.tensor(states, dtype=torch.float32),
-        torch.tensor(actions, dtype=torch.float32),
-        motion_option=motion_option)
     print(np.abs(_next_tvecs[:-1] - tvecs[1:-1]).max(),
           np.abs(_next_qvecs[:-1] - qvecs[1:-1]).max(),
           np.abs(_vs - vs).max(),
           np.abs(_omegas - omegas).max())
-    print(np.abs(__next_tvecs.numpy()[:-1] - tvecs[1:-1]).max(),
-          np.abs(__next_qvecs.numpy()[:-1] - qvecs[1:-1]).max(),
-          np.abs(__vs.numpy() - vs).max(),
-          np.abs(__omegas.numpy() - omegas).max())
-    print(time.time() - t0)
+    # __next_tvecs, __next_qvecs, __vs, __omegas = reverse_states_actions_tensor(
+    #     torch.tensor(states, dtype=torch.float32),
+    #     torch.tensor(actions, dtype=torch.float32),
+    #     motion_option=motion_option)
+    # print(np.abs(__next_tvecs.numpy()[:-1] - tvecs[1:-1]).max(),
+    #       np.abs(__next_qvecs.numpy()[:-1] - qvecs[1:-1]).max(),
+    #       np.abs(__vs.numpy() - vs).max(),
+    #       np.abs(__omegas.numpy() - omegas).max())
+    print(f'time: {time.time() - t0:.4f}s')
 
-    # action_downsample  = 5
+    action_downsample = 5
     t0 = time.time()
     states_, actions_ = get_states_actions(
-        tvecs, qvecs, motion_option=motion_option, action_downsample=5)
+        tvecs[::action_downsample], qvecs[::action_downsample],
+        motion_option=motion_option)
     next_tvecs_, next_qvecs_, _, _ = reverse_states_actions(
         states_, actions_, motion_option=motion_option)
-    print(np.abs(next_tvecs_ - tvecs[5:-1:5]).max(),
-          np.abs(next_qvecs_ - qvecs[5:-1:5]).max())
-    print(time.time() - t0)
+    print(np.abs(next_tvecs_ - tvecs[action_downsample:-1:action_downsample]).max(),
+          np.abs(next_qvecs_ - qvecs[action_downsample:-1:action_downsample]).max())
+    print(f'time: {time.time() - t0:.4f}s')
     pass
 
 

@@ -22,23 +22,26 @@ class DVGFormerConfig(PretrainedConfig):
             self,
             vision_backbone='dinov2_vits14_reg',
             use_depth=True,
+            execute_option='action',  # action or next_state
             prediction_option='iterative',  # iterative or one-shot
             action_option='dense',  # dense or sparse
             motion_option='local',  # local or global motion
+            image_option='all',  # init or all or none
             image_featmap_shape=(5, 9),
+            quality_option='embed',  # embed or mlp
             num_quantile_bins=10,
-            use_quality_mlps=False,
             drone_types=[1],  # 0: non-fpv, 1: fpv
             n_token_noise=1,
             n_token_quality=0,
             n_token_drone_type=1,
-            n_token_state=1,
+            n_token_state=0,
             n_token_boa=1,
             n_token_action=1,
             pad_side='right',  # left or right
             pad_token_value=0,
             fps=3,
             max_model_frames=150,  # max sequence length to consider
+            chunk_frame_step=None,
             n_future_frames=15,  # number of future frames to predict
             fix_image_width=True,
             hidden_size=384,
@@ -104,24 +107,34 @@ class DVGFormerConfig(PretrainedConfig):
 
         self.fps = fps
         assert self.original_fps % fps == 0
-        self.fps_downsample = int(self.original_fps / fps)
+        self.fps_downsample = self.original_fps // fps
         assert max_model_frames % self.fps_downsample == 0, 'max_model_frames should be divisible by fps_downsample'
+
+        self.execute_option = execute_option
+        if self.execute_option == 'next_state':
+            # execute the next state prediction
+            prediction_option = 'one-shot'
+            action_option = 'sparse'
+            loss_coef_state = 1
+            loss_coef_action = 0
+
         # action option: dense or sparse
         self.action_option = action_option
         if self.action_option == 'dense':
             self.action_fps = self.original_fps
         elif self.action_option == 'sparse':
             self.action_fps = self.fps
+            prediction_option = 'one-shot'
         else:
             raise ValueError(f'unknown action option: {self.action_option}')
         self.action_downsample = self.original_fps // self.action_fps
-        self.n_action_to_predict = self.fps_downsample // self.action_downsample
-        self.prediction_option = prediction_option
-        if self.prediction_option == 'one-shot' or n_token_action == 0:
+        self.n_action_every_image = self.action_fps // self.fps
+        self.prediction_option = prediction_option if n_token_action > 0 else 'one-shot'
+        if self.prediction_option == 'one-shot':
             # predict all actions in one token
-            self.per_token_preds = self.n_action_to_predict
+            self.per_token_preds = self.n_action_every_image
         elif self.prediction_option == 'iterative':
-            # predict one action in one token, and repeat for n_action_to_predict times
+            # predict one action in one token, and repeat for n_action_every_image times
             self.per_token_preds = 1
         else:
             raise ValueError(
@@ -129,6 +142,12 @@ class DVGFormerConfig(PretrainedConfig):
 
         # max sequence length to consider
         self.max_model_frames = max_model_frames
+        # chunking frame skip
+        if chunk_frame_step is None:
+            chunk_frame_step = self.max_model_frames // 2 // self.fps_downsample * \
+                self.fps_downsample
+        assert chunk_frame_step % self.fps_downsample == 0, 'chunk_frame_step should be divisible by fps_downsample'
+        self.chunk_frame_step = chunk_frame_step
         # number of future frames to predict
         self.n_future_frames = n_future_frames
 
@@ -136,8 +155,8 @@ class DVGFormerConfig(PretrainedConfig):
         # noise token
         self.n_token_noise = n_token_noise
         # quality token
+        self.quality_option = quality_option
         self.num_quantile_bins = num_quantile_bins
-        self.use_quality_mlps = use_quality_mlps
         self.n_token_quality = n_token_quality
         # drone type token
         self.drone_types = drone_types
@@ -147,6 +166,7 @@ class DVGFormerConfig(PretrainedConfig):
         # state token
         self.n_token_state = n_token_state
         # image token
+        self.image_option = image_option
         if image_featmap_shape is not None:
             if isinstance(image_featmap_shape, int):
                 h, w = self.image_resolution
@@ -162,21 +182,29 @@ class DVGFormerConfig(PretrainedConfig):
             self.image_featmap_shape = list(
                 map(lambda x: int(np.ceil(np.ceil(x / self.backbone_downsample))),
                     self.image_resolution))
-        self.n_token_image = int(np.prod(self.image_featmap_shape))
+        if self.image_option == 'init':
+            self.n_token_init_image = int(np.prod(self.image_featmap_shape))
+            self.n_token_image = 0
+        elif self.image_option == 'all':
+            self.n_token_init_image = 0
+            self.n_token_image = int(np.prod(self.image_featmap_shape))
+        elif self.image_option == 'none':
+            self.n_token_init_image = 0
+            self.n_token_image = 0
         # begin of action token
         self.n_token_boa = n_token_boa
         # action token
         self.n_token_action = n_token_action
 
         # number of tokens for overall sequence conditioning
-        self.n_token_prepend = (
-            self.n_token_noise + self.n_token_quality + self.n_token_drone_type)
+        self.n_token_prepend = (self.n_token_noise + self.n_token_quality + self.n_token_drone_type +
+                                self.n_token_init_image)
         # number of tokens for one frame
-        self.n_token_frame = (self.n_token_state + self.n_token_image + self.n_token_boa +
-                              self.n_token_action * self.n_action_to_predict // self.per_token_preds)
+        self.n_token_one_frame = (self.n_token_state + self.n_token_image + self.n_token_boa +
+                                  self.n_token_action * self.n_action_every_image // self.per_token_preds)
         # number of tokens to predict (number of action tokens) within one frame
         self.n_token_predict = (
-            self.n_token_action * self.n_action_to_predict // self.per_token_preds)
+            self.n_token_action * self.n_action_every_image // self.per_token_preds)
 
         # padding side
         assert pad_side in ['left', 'right']
@@ -201,8 +229,8 @@ class DVGFormerConfig(PretrainedConfig):
         kwargs.pop('gpt2_config', None)
         self.gpt2_config = GPT2Config(
             n_embd=hidden_size,
-            n_positions=(max_model_frames // self.fps_downsample * self.n_token_frame +
-                         self.n_token_quality + self.n_token_drone_type + self.n_token_noise),  # max length of the sequence
+            n_positions=(max_model_frames // self.fps_downsample * self.n_token_one_frame +
+                         self.n_token_prepend),  # max length of the sequence
             n_layer=n_layer,
             n_head=n_head,
             attn_implementation=attn_implementation,

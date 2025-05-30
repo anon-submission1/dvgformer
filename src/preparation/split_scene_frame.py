@@ -102,7 +102,7 @@ def _recons_images_from_ffmpeg(video_folder, start_s, end_s, recons_array,
     '''
     # more action tokens for each tuple (image, state, actions) if original_fps > fps
     assert original_fps % fps == 0
-    fps_downsample = int(original_fps / fps)
+    fps_downsample = original_fps // fps
 
     # sequence length
     seq_length = len(recons_array) // fps_downsample

@@ -23,6 +23,45 @@ from src.utils.quaternion_operations import convert_to_local_frame, horizontal_f
 from src.utils.flexible_fs import FlexibleFileSystem
 from src.utils.colmap_official_read_write_model import read_cameras_binary, read_images_binary, read_points3D_binary
 
+# DJI Mavic 3 Pro Specifications
+# Hasselblad Camera
+#     FOV: 84°
+#     Format Equivalent: 24mm
+# Medium Tele Camera
+#     FOV: 35°
+#     Format Equivalent: 70mm
+# Tele Camera
+#     FOV: 15°
+#     Format Equivalent: 166mm
+# Max Ascent Speed
+#     8 m/s
+# Max Descent Speed
+#     6 m/s
+# Max Horizontal Speed (at sea level, no wind)
+#     21 m/s
+
+# DJI Avata 2 Specifications
+# Camera
+#     FOV: 155°
+#     Format Equivalent: 12 mm
+# Max Ascent Speed
+#     6 m/s (Normal mode)
+#     9 m/s (Sport mode)
+# Max Descent Speed
+#     6 m/s (Normal mode)
+#     9 m/s (Sport mode)
+# Max Horizontal Speed (near sea level, no wind)
+#     8 m/s (Normal mode)
+#     16 m/s (Sport mode)
+#     27 m/s (Manual mode)*
+
+# scaling on top of drone speed
+# fpv max speed of 16 m/s = 1.0 m/frame at 15 fps
+# non-fpv max speed of 8 m/s = 0.5 m/frame at 15 fps
+speed_multipliers = {0: 0.5,  # 0.5 m/frame for non-fpv drones
+                     1: 1.0  # 1 m/frame for fpv drones
+                     }
+
 
 def color_jitter(img, brightness=0.0, contrast=0.0, saturation=0.0, hue=0.0, fn_idx=(0, 1, 2, 3)):
     for fn_id in fn_idx:
@@ -47,9 +86,10 @@ class DronePathSequenceDataset(Dataset):
     original_fps = 15  # original frame rate used for colmap reconstruction
     max_data_frames = 150  # max number of original frames
 
-    def __init__(self, root, hdf5_fname, fps=3, action_fps=15,
-                 max_model_frames=150, n_future_frames=15,
-                 resolution=(180, 320), motion_option='global', fix_image_width=True, skip_portrait_videos=True, drone_types=[0, 1],
+    def __init__(self, root, hdf5_fname, split_name='trainval', fps=3, action_fps=15,
+                 max_model_frames=150, chunk_frame_step=None, n_future_frames=15,
+                 image_option='all', resolution=(180, 320), fix_image_width=True, skip_portrait_videos=True,
+                 motion_option='local', drone_types=[0, 1], speed_scale=True,
                  use_cuda_ffmpeg=False, noise_dim=384,
                  random_horizontal_flip=False, random_scaling=False, random_temporal_crop=False, random_color_jitter=False,
                  ignore_value=-100, num_quantile_bins=100):
@@ -57,30 +97,35 @@ class DronePathSequenceDataset(Dataset):
 
         self.root = root
         self.hdf5_fname = hdf5_fname
-        # frame rate for the auto-regressive task tuples (image, state, action)
+        # frame rate for the images
         self.fps = fps
 
         # max sequence length to consider
         self.max_model_frames = max_model_frames
+        # chunking frame skip
+        if chunk_frame_step is None:
+            chunk_frame_step = self.max_model_frames // 2
+        self.chunk_frame_step = chunk_frame_step
         # fewer images if original_fps > fps: only one image every fps_downsample frames
         # (image, state, action), (state, action), ..., (state, action)
         assert self.original_fps % fps == 0
-        self.fps_downsample = int(self.original_fps / fps)
+        self.fps_downsample = self.original_fps // fps
         self.action_fps = action_fps
         self.action_downsample = self.original_fps // action_fps
-        self.n_action_to_predict = self.fps_downsample // self.action_downsample
+        self.n_action_every_image = self.action_fps // self.fps
         # future prediction
         self.n_future_frames = n_future_frames  # at original_fps
         self.n_future_steps = self.n_future_frames // self.fps_downsample  # at fps
 
+        self.image_option = image_option
         self.resolution = resolution  # h, w
-
         self.fix_image_width = fix_image_width
 
         self.noise_dim = noise_dim
 
         # drone types: 0 for non-fpv, 1 for fpv
         self.drone_types = drone_types
+        self.speed_scale = speed_scale
 
         self.motion_option = motion_option
         # state: tvec, qvec (all in global reference frame)
@@ -102,11 +147,6 @@ class DronePathSequenceDataset(Dataset):
 
         self.num_quantile_bins = num_quantile_bins
 
-        # speed of the camera movement in blender coord (meter/frame) at 15 fps
-        # self.drone_speeds = {0: 0.5,  # 0.5 m/frame for non-fpv drones
-        #                      1: 1,  # 1 m/frame for fpv drones
-        #                      }
-
         self.transform_img = T.Compose([
             T.CenterCrop(resolution),
             T.ToTensor(),
@@ -123,6 +163,12 @@ class DronePathSequenceDataset(Dataset):
             print('using cuda for ffmpeg')
         self.num_cuda_devices = torch.cuda.device_count()
 
+        # get video_ids in the split
+        self.video_ids = []
+        with open(f'{self.root}/{split_name}_video_ids.txt', 'r') as f:
+            for line in f.readlines():
+                self.video_ids.append(line.strip())
+
         # Update: change from tar to HDF5 for the SWMR mode for multi workers in dataloader
         self.h5_fs = FlexibleFileSystem(
             f'{self.root}/{self.hdf5_fname if self.hdf5_fname else ""}')
@@ -132,6 +178,8 @@ class DronePathSequenceDataset(Dataset):
         self.points_info = []
         total_length = 0
         for video_id in tqdm.tqdm(sorted(self.h5_fs.listdir(self.root))):
+            if video_id not in self.video_ids:
+                continue
             try:
                 with self.h5_fs.open(f'{self.root}/{video_id}/data.json') as f:
                     metadata = json.load(f)
@@ -181,9 +229,9 @@ class DronePathSequenceDataset(Dataset):
                          'start_idx': 0,
                          'end_idx': len(recons_array)})
                 else:
-                    chunk_step = self.max_model_frames // 2 // self.fps_downsample * self.fps_downsample
-                    for start_idx in range(0, len(recons_array) //
-                                           self.fps_downsample * self.fps_downsample - chunk_step, chunk_step):
+                    max_seq_length = len(
+                        recons_array) // self.fps_downsample * self.fps_downsample
+                    for start_idx in range(0, max_seq_length - self.chunk_frame_step, self.chunk_frame_step):
                         self.data_list.append(
                             {'result_fpath': result_fpath,
                              'start_idx': start_idx,
@@ -228,12 +276,12 @@ class DronePathSequenceDataset(Dataset):
         start_idx = self.data_list[index]['start_idx']
         end_idx = self.data_list[index]['end_idx']
         video_id = result_fpath.split('/')[-2]
-        video_stats = self.video_stats[video_id]
+        video_stat = self.video_stats[video_id]
         scene = os.path.basename(result_fpath).split(
             '-')[0].replace('scene', '')
         recons_index = int(os.path.basename(result_fpath).split(
             '-')[1].replace('recons', ''))
-        is_fpv = int(video_stats['is_fpv'])
+        is_fpv = int(video_stat['is_fpv'])
 
         # recons info
         with self.h5_fs.open(result_fpath, 'r') as f:
@@ -310,7 +358,11 @@ class DronePathSequenceDataset(Dataset):
             raw_qvecs[-1], raw_omegas[-1], 1)
         raw_tvecs = np.concatenate([raw_tvecs, final_tvec[None]], axis=0)
         raw_qvecs = np.concatenate([raw_qvecs, final_qvec[None]], axis=0)
-
+        # modulate the speed based on the drone type
+        # 0: non-fpv max speed of 8 m/s = 0.5 m/frame at 15 fps
+        # 1: fpv max speed of 16 m/s = 1.0 m/frame at 15 fps
+        if self.speed_scale:
+            raw_tvecs *= speed_multipliers[is_fpv]
         # reference frame
         ref_tvec, ref_qvec = raw_tvecs[0], raw_qvecs[0]
 
@@ -321,9 +373,6 @@ class DronePathSequenceDataset(Dataset):
             tvecs[i], qvecs[i], _, _ = convert_to_local_frame(
                 ref_tvec, ref_qvec,
                 raw_tvecs[i], raw_qvecs[i])
-        # modulate the speed based on the drone type
-        # tvecs *= self.drone_speeds[is_fpv]
-        # vs *= self.drone_speeds[is_fpv]
         # sequence length based on the start and end index
         seq_length = (end_idx - start_idx) // self.fps_downsample
         # time steps (same length as image/state)
@@ -338,12 +387,19 @@ class DronePathSequenceDataset(Dataset):
         else:
             aug_tvecs, aug_qvecs = tvecs, qvecs
 
-        # states & actions are self.n_action_to_predict times the length
+        # states & actions are self.n_action_every_image times the length
         time_range = (time_steps[:, None] * self.fps_downsample +
-                      np.arange(self.n_action_to_predict))
+                      np.arange(self.n_action_every_image))
         _states, _actions = get_states_actions(
-            aug_tvecs, aug_qvecs,
-            motion_option=self.motion_option, action_downsample=self.action_downsample)
+            aug_tvecs[::self.action_downsample], aug_qvecs[::self.action_downsample],
+            motion_option=self.motion_option)
+        # if not self.speed_scale:
+        #     # normalize the scale of the trajectory
+        #     v = _actions[:, :3]
+        #     avg_v_norm = np.mean(np.linalg.norm(v, axis=1), axis=0)
+        #     _states[:, :3] /= avg_v_norm
+        #     _actions[:, :3] /= avg_v_norm
+
         # include the last state
         next_t, next_q, _, _ = reverse_states_actions(
             _states[[-1]], _actions[[-1]], motion_option=self.motion_option)
@@ -351,38 +407,42 @@ class DronePathSequenceDataset(Dataset):
             [_states, np.concatenate([next_t, next_q], axis=1)], axis=0)
         next_states = _states[time_range // self.action_downsample + 1]
         states = _states[time_range // self.action_downsample]
-        # if sparse action, make sure the action is still of the same norm
-        actions = (_actions[time_range // self.action_downsample] /
-                   self.action_downsample)
-        # compute the future waypoints
-        n_step_vs = np.ones([seq_length + self.n_future_steps - 1, 3]
-                            ) * self.ignore_value
-        n_step_omegas = np.ones([seq_length + self.n_future_steps - 1, 3]
-                                ) * self.ignore_value
-        for i in range(seq_length + self.n_future_steps - 1):
-            if (time_steps[0] + i + 1) * self.fps_downsample >= len(aug_tvecs):
-                break
-            n_step_vs[i] = (aug_tvecs[(time_steps[0] + i + 1) * self.fps_downsample] -
-                            aug_tvecs[(time_steps[0] + i) * self.fps_downsample])
-            n_step_omegas[i] = quaternions_to_angular_velocity(
-                aug_qvecs[(time_steps[0] + i) * self.fps_downsample],
-                aug_qvecs[(time_steps[0] + i + 1) * self.fps_downsample], 1)
-            if self.motion_option == 'local':
-                # change the global coord system to the initial frame
-                _, _, n_step_vs[i], n_step_omegas[i] = convert_to_local_frame(
-                    aug_tvecs[(time_steps[0] + i) * self.fps_downsample],
-                    aug_qvecs[(time_steps[0] + i) * self.fps_downsample],
-                    None, None, n_step_vs[i], n_step_omegas[i])
-        n_step_actions = np.concatenate(
-            [n_step_vs, n_step_omegas], axis=1)[np.arange(seq_length)[:, None] +
-                                                np.arange(self.n_future_steps)]
+        actions = _actions[time_range // self.action_downsample]
+        # # compute the future waypoints
+        # n_step_vs = np.ones([seq_length + self.n_future_steps - 1, 3]
+        #                     ) * self.ignore_value
+        # n_step_omegas = np.ones([seq_length + self.n_future_steps - 1, 3]
+        #                         ) * self.ignore_value
+        # for i in range(seq_length + self.n_future_steps - 1):
+        #     if (time_steps[0] + i + 1) * self.fps_downsample >= len(aug_tvecs):
+        #         break
+        #     n_step_vs[i] = (aug_tvecs[(time_steps[0] + i + 1) * self.fps_downsample] -
+        #                     aug_tvecs[(time_steps[0] + i) * self.fps_downsample])
+        #     n_step_omegas[i] = quaternions_to_angular_velocity(
+        #         aug_qvecs[(time_steps[0] + i) * self.fps_downsample],
+        #         aug_qvecs[(time_steps[0] + i + 1) * self.fps_downsample], 1)
+        #     if self.motion_option == 'local':
+        #         # change the global coord system to the initial frame
+        #         _, _, n_step_vs[i], n_step_omegas[i] = convert_to_local_frame(
+        #             aug_tvecs[(time_steps[0] + i) * self.fps_downsample],
+        #             aug_qvecs[(time_steps[0] + i) * self.fps_downsample],
+        #             None, None, n_step_vs[i], n_step_omegas[i])
+        # n_step_actions = np.concatenate(
+        #     [n_step_vs, n_step_omegas], axis=1)[np.arange(seq_length)[:, None] +
+        #                                         np.arange(self.n_future_steps)]
         pass
         t1 = time.time()
 
         # load images
         frame_folder = f'{self.root}/{video_id}/scene{scene}-recons{recons_index}-frames'
         image_dict = {}
-        for i in (time_steps * self.fps_downsample).tolist():
+        image_timestamps = time_steps * self.fps_downsample
+        if self.image_option == 'init':
+            image_timestamps = image_timestamps[:1]
+        elif self.image_option == 'none':
+            image_timestamps = np.array([])
+
+        for i in (image_timestamps).tolist():
             fname = recons_array[i, 0]
             if self.h5_fs.h5_file is not None:
                 with self.h5_fs.open(f'{frame_folder}/{fname}', 'r') as f:
@@ -444,7 +504,7 @@ class DronePathSequenceDataset(Dataset):
 
         # images
         images = []
-        for i in (time_steps * self.fps_downsample).tolist():
+        for i in (image_timestamps).tolist():
             fname = recons_array[i, 0]
             img = image_dict[fname].convert('RGB')
             # PIL in w, h format
@@ -458,7 +518,7 @@ class DronePathSequenceDataset(Dataset):
                                    jitter_fn_idx)
             img = self.transform_img(img)
             images.append(img)
-        images = torch.stack(images)
+        images = torch.stack(images) if len(images) > 0 else torch.zeros(0)
 
         t3 = time.time()
 
@@ -470,10 +530,10 @@ class DronePathSequenceDataset(Dataset):
         actions = (actions - action_avg) / action_std
         actions = torch.tensor(actions, dtype=torch.float32)
         stop_labels = torch.zeros(seq_length)
-        future_mask = (n_step_actions != self.ignore_value).all(axis=-1)
-        n_step_actions[future_mask] = (
-            n_step_actions[future_mask] - action_avg) / action_std
-        n_step_actions = torch.tensor(n_step_actions, dtype=torch.float32)
+        # future_mask = (n_step_actions != self.ignore_value).all(axis=-1)
+        # n_step_actions[future_mask] = (
+        #     n_step_actions[future_mask] - action_avg) / action_std
+        # n_step_actions = torch.tensor(n_step_actions, dtype=torch.float32)
 
         scene_part = int(scene.split('_')[1])
         next_scene = f'{scene.split("_")[0]}_{scene_part + 1}'
@@ -486,11 +546,12 @@ class DronePathSequenceDataset(Dataset):
         data_dict = {
             # inputs
             'noise_embed': torch.tensor(noise_embed, dtype=torch.float32),
-            'quality': video_stats['quality_quantile'],
+            'quality': video_stat['quality_quantile'],
             'drone_type': is_fpv,
             'intrinsic': torch.from_numpy(K).float(),
             'time_steps': time_steps,
             'images': images,
+            # 'images': torch.zeros([seq_length, 3, self.resolution[0], self.resolution[1]]),
             'states': states,
             'actions': actions,
             'seq_length': seq_length,
@@ -498,7 +559,7 @@ class DronePathSequenceDataset(Dataset):
             'next_state_labels': next_states,
             'action_labels': actions.clone(),
             'stop_labels': stop_labels,
-            'future_action_labels': n_step_actions,
+            # 'future_action_labels': n_step_actions,
             'drone_type_labels': is_fpv,
         }
 
@@ -554,57 +615,30 @@ def main():
 
     set_seed(0)
     # logging.basicConfig(level=logging.DEBUG)
-    motion_option = 'global'
+    motion_option = 'local'
     dataset = DronePathSequenceDataset('youtube_drone_videos',
                                        'dataset_mini.h5',
-                                       #    resolution=(1080, 1920),
+                                       split_name='trainval',
+                                       drone_types=[0, 1],
+                                       #    action_fps=3,
                                        motion_option=motion_option,
                                        #    random_horizontal_flip=True,
-                                       random_scaling=True,
-                                       random_temporal_crop=True,
+                                       #    random_scaling=True,
+                                       #    random_temporal_crop=True,
                                        #    max_model_frames=30,
                                        )
     print(len(dataset))
-    dataset.__getitem__(1, visualize=True)
-    dataset.__getitem__(76, visualize=True)
-    # indices = [np.random.randint(len(dataset)) for _ in range(20)]
-    # for idx in indices:
-    #     dataset.__getitem__(idx, visualize=False)
+    data = dataset.__getitem__(0, visualize=True)
+    # for idx in range(len(dataset)):
+    #     data = dataset.__getitem__(idx, visualize=False)
+    #     print(idx, data['actions'].view(-1, 6).abs().mean(dim=0))
     #     pass
     return
 
     # dataset statistics
-    # tvec_avgs, tvec_stds = [], []
-    # qvec_avgs, qvec_stds = [], []
-    # v_avgs, v_stds = [], []
-    # omega_avgs, omega_stds = [], []
-    # for i in tqdm.tqdm(range(2000)):
-    #     tvecs, qvecs, vs, omegas = dataset.__getitem__(i, visualize=False)
-    #     tvec_avgs.append(tvecs.mean())
-    #     tvec_stds.append(tvecs.std())
-    #     qvec_avgs.append(qvecs.mean())
-    #     qvec_stds.append(qvecs.std())
-    #     v_avgs.append(vs.mean())
-    #     v_stds.append(vs.std())
-    #     omega_avgs.append(omegas.mean())
-    #     omega_stds.append(omegas.std())
-    # tvec_avgs = np.stack(tvec_avgs)
-    # tvec_stds = np.stack(tvec_stds)
-    # qvec_avgs = np.stack(qvec_avgs)
-    # qvec_stds = np.stack(qvec_stds)
-    # v_avgs = np.stack(v_avgs)
-    # v_stds = np.stack(v_stds)
-    # omega_avgs = np.stack(omega_avgs)
-    # omega_stds = np.stack(omega_stds)
-    # print(f"{tvec_avgs.mean():.3f}\t{tvec_stds.mean():.3f}\t{tvec_avgs.min():.3f}\t{tvec_avgs.max():.3f}")
-    # print(f"{qvec_avgs.mean():.3f}\t{qvec_stds.mean():.3f}\t{qvec_avgs.min():.3f}\t{qvec_avgs.max():.3f}")
-    # print(f"{v_avgs.mean():.3f}\t{v_stds.mean():.3f}\t{v_avgs.min():.3f}\t{v_avgs.max():.3f}")
-    # print(f"{omega_avgs.mean():.3f}\t{omega_stds.mean():.3f}\t{omega_avgs.min():.3f}\t{omega_avgs.max():.3f}")
-    # return
-
     dataloader = DataLoader(dataset, batch_size=32, shuffle=False,
                             collate_fn=collate_fn_video_drone_path_dataset,
-                            num_workers=0, drop_last=True)
+                            num_workers=4, drop_last=False)
     batch = next(iter(dataloader))
     all_states = []
     all_actions = []
@@ -612,42 +646,79 @@ def main():
     all_masks = []
     all_lens = []
     all_points = []
+    max_seq_length = dataset.max_model_frames // dataset.fps_downsample
     for i, batch in enumerate(tqdm.tqdm(dataloader)):
-        all_states.append(batch['states'].transpose(0, 1))
-        all_actions.append(batch['actions'].transpose(0, 1))
-        all_masks.append(batch['attention_mask'].transpose(0, 1))
-        all_stops.append(batch['stop_labels'].transpose(0, 1))
+        all_states.append(padding(batch['states'], pad_length=max_seq_length))
+        all_actions.append(
+            padding(batch['actions'], pad_length=max_seq_length))
+        all_masks.append(
+            padding(batch['attention_mask'], pad_length=max_seq_length))
+        all_stops.append(
+            padding(batch['stop_labels'], pad_length=max_seq_length))
         all_lens.extend(batch['seq_length'].tolist())
         points = batch.get('pointcloud_labels', None)
         if points is not None:
             points = points[(points != -100).all(dim=-1)]
             all_points.append(points)
-        if i == 10:
-            break
+        # if i == 10:
+        #     break
         pass
-    all_states = padding(all_states).transpose(1, 2).flatten(0, 1)
-    all_actions = padding(all_actions).transpose(1, 2).flatten(0, 1)
-    all_masks = padding(all_masks).transpose(1, 2).flatten(0, 1)
-    all_stops = padding(all_stops).transpose(1, 2).flatten(0, 1)
-    all_states = all_states[all_masks == 1]
-    all_actions = all_actions[all_masks == 1]
-    all_stops = all_stops[all_masks == 1]
-    print(f'states: mean={all_states.mean(dim=[0, 1])}, '
-          f'std={all_states.std(dim=[0, 1])}')
-    print(f'actions: mean={all_actions.mean(dim=[0, 1])}, '
-          f'std={all_actions.std(dim=[0, 1])}')
-    print(f'stops: mean={all_stops.mean()}')
-    print(f'lengths: {np.mean(all_lens)}')
+    all_states = torch.cat(all_states)
+    all_actions = torch.cat(all_actions)
+    all_masks = torch.cat(all_masks)
+    all_stops = torch.cat(all_stops)
+    all_states_ = all_states[all_masks == 1].flatten(0, 1)
+    all_actions_ = all_actions[all_masks == 1].flatten(0, 1)
+    all_stops_ = all_stops[all_masks == 1]
+    print(len(all_states_))
+    # filter only the 1%-99% values for each dimension
+    np.set_printoptions(precision=5, suppress=True)
+    for value in [all_states_, all_actions_]:
+        means, stds = [], []
+        lows, highs = [], []
+        for i in range(value.shape[1]):
+            lower_bound = torch.quantile(value[:, i], 0.01)
+            upper_bound = torch.quantile(value[:, i], 0.99)
+            new_value = value[:, i][(value[:, i] >= lower_bound) & (
+                value[:, i] <= upper_bound)]
+            means.append(new_value.mean())
+            stds.append(new_value.std())
+            lows.append(lower_bound)
+            highs.append(upper_bound)
+        means = torch.stack(means).numpy()
+        stds = torch.stack(stds).numpy()
+        lows = torch.stack(lows).numpy()
+        highs = torch.stack(highs).numpy()
+        print(f'{value.shape[1]} dimensions: mean={means}, std={stds}')
+        print(
+            f'1%-99%: low={lows}, high={highs}\n0%-100%: low={value.min(dim=0)[0].numpy()}, high={value.max(dim=0)[0].numpy()}\n')
+    print(f'states: mean={all_states_.mean(dim=0).numpy()}, '
+          f'std={all_states_.std(dim=0).numpy()}')
+    print(f'actions: mean={all_actions_.mean(dim=0).numpy()}, '
+          f'std={all_actions_.std(dim=0).numpy()}')
+    print(f'stops: mean={all_stops_.mean():.5f}, ')
+    print(f'lengths: {np.mean(all_lens):.5f}')
     if len(all_points) > 0:
         all_points = torch.cat(all_points)
         all_points = all_points.clamp(-1e4, 1e4)
         print(
             f'points: mean={all_points.mean(dim=0)}, std={all_points.std(dim=0)}')
-    tvec_norms = all_states[:, :3].norm(dim=-1)
-    v_norms = all_actions[:, :3].norm(dim=-1)
-    omega_norms = all_actions[:, 3:].norm(dim=-1)
+    tvec_norms = all_states_[:, :3].norm(dim=-1)
+    v_norms = all_actions_[:, :3].norm(dim=-1)
+    omega_norms = all_actions_[:, 3:].norm(dim=-1)
+
+    # filter only the 1%-99% values
     print(
-        f'norms: tvec={tvec_norms.mean()}, v={v_norms.mean()}, omega={omega_norms.mean()}')
+        f'norms: tvec={tvec_norms.mean():.5f}, v={v_norms.mean():.5f}, omega={omega_norms.mean():.5f}')
+    for value in [tvec_norms, v_norms, omega_norms]:
+        lower_bound = torch.quantile(value, 0.01)
+        upper_bound = torch.quantile(value, 0.99)
+        new_value = value[(value >= lower_bound) & (value <= upper_bound)]
+        means = new_value.mean()
+        lows = lower_bound
+        highs = upper_bound
+        print(
+            f'mean={means:.5f}\t1%-99%: low={lows:.5f}, high={highs:.5f}\t0%-100%: low={value.min():.5f}, high={value.max():.5f}')
     # for i in tqdm.tqdm(range(len(dataset))):
     #     dataset.__getitem__(i)
     pass

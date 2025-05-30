@@ -188,14 +188,14 @@ class BlenderCameraEnv(gym.Env):
 
         self.scene_fpath = scene_fpath
         self.run_dir = run_dir
-        # frame rate for the auto-regressive task tuples (image, state, actions)
+        # frame rate for the images
         self.fps = fps
         # more action tokens for each tuple (image, state, actions) if original_fps > fps
         assert self.original_fps % fps == 0
-        self.fps_downsample = int(self.original_fps / fps)
+        self.fps_downsample = self.original_fps // fps
         self.action_fps = action_fps
         self.action_downsample = self.original_fps // action_fps
-        self.n_action_to_predict = self.fps_downsample // self.action_downsample
+        self.n_action_every_image = self.action_fps // self.fps
         self.video_duration = video_duration
         # max number of original frames
         self.max_data_frames = video_duration * action_fps
@@ -210,45 +210,6 @@ class BlenderCameraEnv(gym.Env):
 
         self.t0 = None
         self.run_stepped = False
-
-        # DJI Mavic 3 Pro Specifications
-        # Hasselblad Camera
-        #     FOV: 84°
-        #     Format Equivalent: 24mm
-        # Medium Tele Camera
-        #     FOV: 35°
-        #     Format Equivalent: 70mm
-        # Tele Camera
-        #     FOV: 15°
-        #     Format Equivalent: 166mm
-        # Max Ascent Speed
-        #     8 m/s
-        # Max Descent Speed
-        #     6 m/s
-        # Max Horizontal Speed (at sea level, no wind)
-        #     21 m/s
-
-        # DJI Avata 2 Specifications
-        # Camera
-        #     FOV: 155°
-        #     Format Equivalent: 12 mm
-        # Max Ascent Speed
-        #     6 m/s (Normal mode)
-        #     9 m/s (Sport mode)
-        # Max Descent Speed
-        #     6 m/s (Normal mode)
-        #     9 m/s (Sport mode)
-        # Max Horizontal Speed (near sea level, no wind)
-        #     8 m/s (Normal mode)
-        #     16 m/s (Sport mode)
-        #     27 m/s (Manual mode)*
-
-        # scaling on top of drone speed
-        # fpv max speed of 16 m/s = 1.0 m/frame at 15 fps
-        # non-fpv max speed of 8 m/s = 0.5 m/frame at 15 fps
-        self.coord_multipliers = {0: 0.5,  # 0.5 m/frame for non-fpv drones
-                                  1: 1.0  # 1 m/frame for fpv drones
-                                  }
 
         # camera focal length in mm
         self.camera_configs = {0: {'value': [24, 70, 166],
@@ -492,10 +453,8 @@ class BlenderCameraEnv(gym.Env):
         # reverse state and actions
         # tvec(t+1), qvec(t+1), v(t), omega(t)
         state = np.concatenate([self.tvecs[-1], self.qvecs[-1]])
-        # sparse actions was initially shrinked to 1/action_downsample
-        actions = actions * self.action_downsample
         next_tvecs, next_qvecs, vs, omegas = [], [], [], []
-        for i in range(self.n_action_to_predict):
+        for i in range(self.n_action_every_image):
             next_tvec, next_qvec, v, omega = reverse_states_actions(
                 state[None], actions[[i]],
                 motion_option=self.motion_option)
@@ -522,14 +481,13 @@ class BlenderCameraEnv(gym.Env):
             # include the speed multiplier to the tvec and speed
             raw_tvec_multiplied, raw_qvec, _, _ = convert_to_global_frame(
                 self.raw_tvec0, self.raw_qvec0,
-                next_tvecs[i] * self.coord_multipliers[self.drone_type],
-                next_qvecs[i], None, None)
+                next_tvecs[i], next_qvecs[i], None, None)
             # in blender convention
             loc = R_blender_from_colmap @ raw_tvec_multiplied
             # R_colmap is for rotating the colmap world plane to the actual camera direction
             R_colmap = quat2mat(raw_qvec)
             # R_blender is for rotating the blender world plane to the actual camera direction
-            R_blender = R_blender_from_colmap @  R_colmap
+            R_blender = R_blender_from_colmap @ R_colmap
             # retrieve the global rotation (R_rot) needed for rotating the blender default camera direction
             # R_rot @ R_bcam = R_blender
             R_rot = R_blender @ R_blender_cam_dir.T
@@ -621,7 +579,7 @@ class BlenderCameraEnv(gym.Env):
         # save the configs
         # print('saving the configs...')
         os.makedirs(self.run_dir, exist_ok=True)
-        np.savetxt(f'{self.run_dir}/{run_name}_{self.seed}_{cur_datetime}_config.txt',
+        np.savetxt(f'{self.run_dir}/{self.seed:05d}_{run_name}_{cur_datetime}_config.txt',
                    np.concatenate([self.raw_locs, self.raw_rots], axis=1),
                    fmt='%f',
                    header=(f'{self.scene_fpath} fps:{self.fps} action-fps:'
@@ -630,9 +588,10 @@ class BlenderCameraEnv(gym.Env):
 
         def save_banner():
             images = []
+        # save a banner image at 1 fps
             for image_fname in sorted(os.listdir(f'{self.run_dir}/frames')):
                 frame_id = int(image_fname.split('_')[-1].split('.')[0]) - 1
-                if frame_id % (30 // self.fps) == 0:
+                if frame_id % 30 == 0:
                     images.append(Image.open(
                         f'{self.run_dir}/frames/{image_fname}'))
             # concatenate the images horizontally
@@ -642,9 +601,8 @@ class BlenderCameraEnv(gym.Env):
             for i in range(len(images)):
                 banner.paste(images[i], (i * int(w * 1.01), 0))
             banner.save(
-                f'{self.run_dir}/{run_name}_{self.seed}_{cur_datetime}_{mode}_{self.fps}fps.jpg')
+                f'{self.run_dir}/{self.seed:05d}_{run_name}_{cur_datetime}_{mode}_{self.fps}fps.jpg')
 
-        # save a banner image at self.fps
         if os.path.exists(f'{self.run_dir}/frames') and self.run_stepped:
             save_banner()
         else:
@@ -673,6 +631,7 @@ class BlenderCameraEnv(gym.Env):
 
                 fpath = f'{self.run_dir}/frames/{mode}_{i + 1:03d}.png'
                 render_blender_image(fpath, i + 1)
+            save_banner()
             print(f'{f"run time: {t0 - self.t0:.2f}s, " if self.run_stepped  else ""}'
                   f're-rendering time: {time.time() - t0:.2f}s')
         else:
@@ -682,14 +641,13 @@ class BlenderCameraEnv(gym.Env):
         if save_mp4:
             # print(f"converting to video...")
             frames_to_video(f'{self.run_dir}/frames/{mode}*.png',
-                            f'{self.run_dir}/{run_name}_{self.seed}_{cur_datetime}_{mode}.mp4',
+                            f'{self.run_dir}/{self.seed:05d}_{run_name}_{cur_datetime}_{mode}.mp4',
                             render_fps)
         if save_gif:
             # print(f"converting to gif...")
             frames_to_gif(f'{self.run_dir}/frames/{mode}*.png',
-                          f'{self.run_dir}/{run_name}_{self.seed}_{cur_datetime}_{mode}.gif',
+                          f'{self.run_dir}/{self.seed:05d}_{run_name}_{cur_datetime}_{mode}.gif',
                           render_fps)
-        save_banner()
         return
 
     def load(self, fpath):
@@ -746,7 +704,7 @@ def main():
     fps_downsample = original_fps // fps
     action_fps = 15
     action_downsample = original_fps // action_fps
-    n_action_to_predict = fps_downsample // action_downsample
+    n_action_every_image = action_fps // fps
     # env
     env = BlenderCameraEnv(scene_fpath='blosm/himeji/scene.blend',
                            action_fps=action_fps,
@@ -761,7 +719,6 @@ def main():
 
     # Test the state and action conversion functions
     root, filter_results_path = 'youtube_drone_videos', 'dataset_mini.h5'
-    fps_downsample = 5
 
     result_fpaths = []
     h5_fs = FlexibleFileSystem(
@@ -815,11 +772,10 @@ def main():
 
     total_reward = 0
     time_range = (time_steps[:, None] * fps_downsample +
-                  np.arange(n_action_to_predict))
+                  np.arange(n_action_every_image))
     states, actions = get_states_actions(
-        tvecs, qvecs,
-        motion_option=motion_option,
-        action_downsample=action_downsample)
+        tvecs[::action_downsample], qvecs[::action_downsample],
+        motion_option=motion_option)
     # include the last state
     states = states[time_range // action_downsample]
     actions = actions[time_range // action_downsample]
